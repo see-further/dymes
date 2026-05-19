@@ -8,24 +8,35 @@ on:
     branches: ["main"]
     # Publish semver tags as releases.
     #tags: [ 'v*.*.*' ]
-  pull_request:
-    branches: ["main"]
+#  pull_request:
+#    branches: ["main"]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  oci-build-publish:
-    runs-on: ubuntu-latest
+  build-with-chart:
     permissions:
       contents: read
-      packages: write
-      # This is used to complete the identity challenge
-      # with sigstore/fulcio when running outside of PRs.
       id-token: write
+      pull-requests: write
+      packages: write
+    runs-on: ubuntu-latest
+
+    env:
+      ORG_NAME: see-further
+      PROJECT_NAME: dymes
+      PROJECT_FORMER_NAME: dimes
+      ENV: dev
 
     steps:
+      - name: Print GitHub context
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Event name: $GITHUB_EVENT_NAME"
+          echo "Ref: $GITHUB_REF"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -34,59 +45,99 @@ jobs:
         with:
           version: 0.15.2
 
-      # Disabled until AEGIS hardware check is release-aware
-      # - name: Test build on PR
-      #   if: github.event_name == 'pull_request'
-      #   run: make test
-
       - name: Release build
         id: release-build-step
         # if: github.event_name != 'pull_request'
         run: make release
 
-      - name: Log into registry ${{ env.REGISTRY }}
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          role-to-assume: arn:aws:iam::157305260194:role/GitHubECRPushPolicy
+          aws-region: eu-north-1
 
-      - name: Install cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v3.5.0
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Bump version and push tag
+        uses: anothrNick/github-tag-action@1.62.0
+        id: bump_tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEPLOY_GITHUB_TOKEN }}
+          DRY_RUN: ${{ github.ref != 'refs/heads/develop' }}
+          WITH_V: true
+          DEFAULT_BUMP: minor
+          RELEASE_BRANCHES: develop
+          PRERELEASE: ${{ github.ref != 'refs/heads/develop' }}
+
+      - name: Extract number from new tag
+        id: version_number_extract
+        env:
+          NEW_TAG: ${{ steps.bump_tag.outputs.new_tag }}
+        run: |
+          echo "version=$( echo $NEW_TAG | sed 's/^.//')" >> "$GITHUB_OUTPUT"
+
+      - name: Print latest version number string
+        env:
+          NEW_TAG: ${{ steps.bump_tag.outputs.new_tag }}
+        run: |
+          echo ${{ steps.bump_tag.outputs.new_tag }}
+          echo ${{ steps.bump_tag.outputs.tag }}
+          echo ${{ steps.bump_tag.outputs.part }}
+          echo ${{ steps.version_number_extract.outputs.version }}
+
+      - name: Helm Unittest
+        uses: d3adb5/helm-unittest-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.DEPLOY_GITHUB_TOKEN }}
         with:
-          cosign-release: "v2.2.4"
+          charts: "charts/${{ env.PROJECT_FORMER_NAME }}/"
+          helm-version: v3.19.0
+          
+      - name: Prep helm chart with version
+        env:
+          APP_VERSION: ${{ steps.version_number_extract.outputs.version }}
+          DOCKER_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          DOCKER_REPOSITORY: ${{ env.ORG_NAME }}/${{ env.PROJECT_NAME }}
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+        uses: fjogeleit/yaml-update-action@main
+        with:
+          commitChange: false
+          valueFile: "charts/${{ env.PROJECT_FORMER_NAME }}/values.yaml"
+          propertyPath: 'image.repository'
+          value: "${{ steps.login-ecr.outputs.registry }}/${{ env.ORG_NAME}}"
+
+      - name: Lint Helm charts
+        run: |
+          helm lint --strict charts/${{ env.PROJECT_FORMER_NAME }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Build and push Docker images
-        id: docker-build-and-push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Sign the published Docker image
-        if: ${{ github.event_name != 'pull_request' }}
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
-          DIGEST: ${{ steps.docker-build-and-push.outputs.digest }}
-        # This step uses the identity token to provision an ephemeral certificate
-        # against the sigstore community Fulcio instance.
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+          DOCKER_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          DOCKER_REPOSITORY: ${{ env.ORG_NAME }}/${{ env.PROJECT_NAME }}
+          IMAGE_TAG: ${{ steps.version_number_extract.outputs.version }}
+          ENV: ${{ env.ENV }}
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 -t $DOCKER_REGISTRY/$DOCKER_REPOSITORY:$IMAGE_TAG --push .
+          echo "::set-output name=image::$DOCKER_REGISTRY/$DOCKER_REPOSITORY:$IMAGE_TAG"
+
+      - name: Build helm chart
+        env:
+          CHART_VERSION: ${{ steps.version_number_extract.outputs.version }}
+        run:  |
+          helm dependency build charts/${PROJECT_FORMER_NAME}
+          helm package --version ${CHART_VERSION} --app-version ${CHART_VERSION} charts/${PROJECT_FORMER_NAME}
+  
+      - name: Push helm chart
+        if: github.ref == 'refs/heads/develop'
+        env:
+          HELM_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          CHART_VERSION: ${{ steps.version_number_extract.outputs.version }}
+        run: |
+          echo "Target is oci://${{ steps.login-ecr.outputs.registry }}"
+          helm push ${PROJECT_NAME}-${CHART_VERSION}.tgz oci://${HELM_REGISTRY}/${ORG_NAME}/chart --debug
