@@ -30,7 +30,7 @@
         },
         .zimq = .{
             .url = "https://github.com/uyha/zimq/archive/refs/tags/zig-0.15.2.tar.gz",
-            .hash = "imq-0.0.0-nw1ioBSoAQC8FnNj3-DT5ea6UGatVWanibpUakR4WsOW",
+            .hash = "zimq-0.0.0-nw1ioBSoAQC8FnNj3-DT5ea6UGatVWanibpUakR4WsOW",
         },
     },
 }
