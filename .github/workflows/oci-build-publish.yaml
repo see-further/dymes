@@ -64,8 +64,8 @@ jobs:
           DRY_RUN: ${{ github.ref != 'refs/heads/develop' }}
           WITH_V: true
           DEFAULT_BUMP: minor
-          RELEASE_BRANCHES: develop
-          PRERELEASE: ${{ github.ref != 'refs/heads/develop' }}
+          RELEASE_BRANCHES: main
+          PRERELEASE: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Extract number from new tag
         id: version_number_extract
@@ -130,7 +130,6 @@ jobs:
           helm package --version ${CHART_VERSION} --app-version ${CHART_VERSION} charts/${PROJECT_FORMER_NAME}
   
       - name: Push helm chart
-        if: github.ref == 'refs/heads/develop'
         env:
           HELM_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           CHART_VERSION: ${{ steps.version_number_extract.outputs.version }}
